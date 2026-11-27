@@ -349,6 +349,9 @@ body.dark .mode-chip.ai-on{background:#213a2d;border-color:#345e48;color:#7fe0ab
 .google-login-btn{width:100%;height:44px;border-radius:11px;background:#fff;border:1.5px solid #e6d4dd;color:#3c3137;font-size:13.5px;font-weight:700;display:flex;align-items:center;justify-content:center;gap:10px;box-shadow:0 3px 10px #59364512;transition:.18s;margin:10px 0}
 .google-login-btn:hover{background:#fdf7fa;border-color:#e29eb2;transform:translateY(-1px)}
 .google-login-btn svg{width:18px;height:18px;flex:none}
+.gsi-wrap{display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:46px;margin:10px 0 6px}
+.classic-oauth-link{display:block;text-align:center;font-size:11px;color:#a48996;background:none;margin:2px auto 6px;text-decoration:underline}
+.classic-oauth-link:hover{color:#cf7794}
 
 .tier-compare{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:10px 0 14px}
 .tier-box{padding:11px 12px;border-radius:11px;border:1px solid #f0dfe6;background:#fcf8fa;font-size:11.5px;line-height:1.55}
@@ -611,6 +614,7 @@ const icons = (name) => `<svg><use href="#i-${name}"/></svg>`;
 
 const DEFAULT_SUPABASE_URL = 'https://iuahrxnbkeriemxzixse.supabase.co';
 const DEFAULT_SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Iml1YWhyeG5ia2VyaWVteHppeHNlIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTUzNzEzOTQsImV4cCI6MjExMDk0NzM5NH0.9pT0KbmhpMVqZG6_U1vCM112T66aop3KboVQ4nYn4ic';
+const DEFAULT_GOOGLE_CLIENT_ID = '666512592245-qh3ufmbmbf1dsuhq05hn8qhlcu0er5hv.apps.googleusercontent.com';
 const GUEST_CHAT_LIMIT = 50;
 const AUTH_CHAT_LIMIT = 150;
 
@@ -726,6 +730,8 @@ const translations = {
     tierAuth2: 'Riwayat aman tersimpan walau keluar website',
     tierAuth3: 'Sinkron antar HP & Laptop (Supabase + IndexedDB)',
     googleBtnText: 'Lanjutkan dengan Akun Google',
+    classicOauthFallback: 'Jika popup diblokir browser, gunakan login redirect',
+    googleClientIdLabel: 'Google OAuth Client ID (untuk nama "MomoTalk" di popup)',
     orEmailText: 'atau masuk cepat dengan alamat Email / Gmail',
     emailLabel: 'Alamat Email (mis. nama@gmail.com)',
     passwordLabel: 'Kata Sandi (min. 6 karakter)',
@@ -839,6 +845,8 @@ const translations = {
     tierAuth2: 'Chat history stays safe even after leaving',
     tierAuth3: 'Syncs across Phone & PC (Supabase + IndexedDB)',
     googleBtnText: 'Continue with Google Account',
+    classicOauthFallback: 'If popup is blocked by browser, use redirect login',
+    googleClientIdLabel: 'Google OAuth Client ID (shows "MomoTalk" in popup)',
     orEmailText: 'or quick sign-in with your Email / Gmail address',
     emailLabel: 'Email Address (e.g. name@gmail.com)',
     passwordLabel: 'Password (min. 6 characters)',
@@ -1182,7 +1190,8 @@ let settings = Object.assign({
   aiModel: AI_PROVIDERS.openrouter.defaultModel,
   aiTemp: 0.8,
   supabaseUrl: DEFAULT_SUPABASE_URL,
-  supabaseAnonKey: DEFAULT_SUPABASE_ANON_KEY
+  supabaseAnonKey: DEFAULT_SUPABASE_ANON_KEY,
+  googleClientId: DEFAULT_GOOGLE_CLIENT_ID
 }, loadJSON('momotalk-settings-v3', {}));
 
 let authSession = loadJSON('momotalk-auth-session-v1', null);
@@ -1664,6 +1673,114 @@ async function syncAccountCloud(showFeedback = false) {
     updateStatusIndicators();
     if (showFeedback) toast(t('syncFailToast'));
   }
+}
+
+let gsiScriptPromise = null;
+let currentGsiRawNonce = '';
+
+function ensureGoogleGsiScript() {
+  if (window.google?.accounts?.id) return Promise.resolve(true);
+  if (gsiScriptPromise) return gsiScriptPromise;
+  gsiScriptPromise = new Promise((resolve) => {
+    const s = document.createElement('script');
+    s.src = 'https://accounts.google.com/gsi/client';
+    s.async = true;
+    s.defer = true;
+    s.onload = () => resolve(Boolean(window.google?.accounts?.id));
+    s.onerror = () => resolve(false);
+    document.head.appendChild(s);
+  });
+  return gsiScriptPromise;
+}
+
+async function generateNoncePair() {
+  const bytes = new Uint8Array(24);
+  if (crypto?.getRandomValues) crypto.getRandomValues(bytes);
+  else for (let i = 0; i < 24; i++) bytes[i] = Math.floor(Math.random() * 256);
+  const rawNonce = [...bytes].map((b) => b.toString(16).padStart(2, '0')).join('');
+  if (!crypto?.subtle) return { rawNonce: '', hashedNonce: '' };
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(rawNonce));
+  const hashedNonce = [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('');
+  return { rawNonce, hashedNonce };
+}
+
+async function handleGoogleIdToken(resp) {
+  if (!resp?.credential) return;
+  toast(t('loggingInToast'));
+  const errBox = $('#authErrorBox');
+  if (errBox) errBox.classList.add('hidden');
+  try {
+    const base = settings.supabaseUrl.replace(/\/+$/, '');
+    const bodyPayload = {
+      provider: 'google',
+      id_token: resp.credential
+    };
+    if (currentGsiRawNonce) bodyPayload.nonce = currentGsiRawNonce;
+
+    const res = await fetch(`${base}/auth/v1/token?grant_type=id_token`, {
+      method: 'POST',
+      headers: {
+        'apikey': settings.supabaseAnonKey.trim(),
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(bodyPayload)
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      throw new Error(data.msg || data.error_description || data.message || `HTTP ${res.status}`);
+    }
+    saveAuthSession({
+      access_token: data.access_token,
+      refresh_token: data.refresh_token,
+      expires_at: Math.floor(Date.now() / 1000) + Number(data.expires_in || 3600),
+      user: data.user
+    });
+    await syncAccountCloud(false);
+    updateStatusIndicators();
+    closeModal();
+    toast(t('loginSuccessToast'));
+  } catch (err) {
+    if (errBox) {
+      errBox.textContent = err.message || String(err);
+      errBox.classList.remove('hidden');
+    } else {
+      toast(err.message || String(err));
+    }
+  }
+}
+
+async function mountGoogleSignInButton() {
+  const wrap = $('#googleGsiBtnWrap');
+  const clientId = (settings.googleClientId || DEFAULT_GOOGLE_CLIENT_ID || '').trim();
+  if (!wrap || !clientId) return;
+  const loaded = await ensureGoogleGsiScript();
+  if (!loaded || !window.google?.accounts?.id || !$('#googleGsiBtnWrap')) return;
+
+  try {
+    const { rawNonce, hashedNonce } = await generateNoncePair();
+    currentGsiRawNonce = rawNonce;
+    window.google.accounts.id.initialize({
+      client_id: clientId,
+      callback: handleGoogleIdToken,
+      nonce: hashedNonce || undefined,
+      ux_mode: 'popup',
+      context: 'signin'
+    });
+    const targetWrap = $('#googleGsiBtnWrap');
+    if (!targetWrap) return;
+    targetWrap.innerHTML = '';
+    window.google.accounts.id.renderButton(targetWrap, {
+      type: 'standard',
+      theme: document.body.classList.contains('dark') ? 'filled_black' : 'outline',
+      size: 'large',
+      text: 'continue_with',
+      shape: 'pill',
+      width: Math.min(340, targetWrap.clientWidth || 320),
+      locale: language === 'en' ? 'en' : 'id'
+    });
+    $('#fallbackGoogleBtn')?.classList.add('hidden');
+    $('#classicOauthFallbackBtn')?.classList.remove('hidden');
+  } catch {}
 }
 
 async function startGoogleOAuth() {
@@ -2218,10 +2335,13 @@ function openLimitReachedModal() {
     modal(t('limitGuestTitle'), `
       <p><strong>${safe(pName)} (${GUEST_CHAT_LIMIT}/${GUEST_CHAT_LIMIT})</strong></p>
       <p>${t('limitGuestDesc')}</p>
-      <button type="button" class="google-login-btn" id="startGoogleLoginBtn">
-        <svg><use href="#i-google"/></svg>
-        <span>${t('googleBtnText')}</span>
-      </button>
+      <div id="googleGsiBtnWrap" class="gsi-wrap">
+        <button type="button" class="google-login-btn" id="fallbackGoogleBtn">
+          <svg><use href="#i-google"/></svg>
+          <span>${t('googleBtnText')}</span>
+        </button>
+      </div>
+      <button type="button" class="classic-oauth-link hidden" id="classicOauthFallbackBtn">${t('classicOauthFallback')}</button>
       <div id="googleSetupGuide" class="setup-guide-box hidden">
         ${t('googleNotEnabledNote')}
         <code>${safe(settings.supabaseUrl.replace(/\/+$/, '') + '/auth/v1/callback')}</code>
@@ -2236,6 +2356,7 @@ function openLimitReachedModal() {
         <button type="button" class="primary-action" id="submitEmailAuthBtn">${t('emailAuthBtn')}</button>
       </div>
     `);
+    mountGoogleSignInButton();
   } else {
     modal(t('limitAuthTitle'), `
       <p><strong>${safe(pName)} (${AUTH_CHAT_LIMIT}/${AUTH_CHAT_LIMIT})</strong></p>
@@ -2504,6 +2625,10 @@ function renderCloudAuthTabHtml() {
             <label>${t('sbAnonLabel')}</label>
             <input type="text" id="sbAnonInput" value="${safe(settings.supabaseAnonKey)}">
           </div>
+          <div class="field">
+            <label>${t('googleClientIdLabel')}</label>
+            <input type="text" id="googleClientIdInput" value="${safe(settings.googleClientId || '')}">
+          </div>
           <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px">
             <button type="button" class="mini-btn" id="exportBackupBtn">${t('exportJson')}</button>
             <button type="button" class="mini-btn" id="importBackupBtn">${t('importJson')}</button>
@@ -2536,10 +2661,13 @@ function renderCloudAuthTabHtml() {
         </ul>
       </div>
     </div>
-    <button type="button" class="google-login-btn" id="startGoogleLoginBtn">
-      <svg><use href="#i-google"/></svg>
-      <span>${t('googleBtnText')}</span>
-    </button>
+    <div id="googleGsiBtnWrap" class="gsi-wrap">
+      <button type="button" class="google-login-btn" id="fallbackGoogleBtn">
+        <svg><use href="#i-google"/></svg>
+        <span>${t('googleBtnText')}</span>
+      </button>
+    </div>
+    <button type="button" class="classic-oauth-link hidden" id="classicOauthFallbackBtn">${t('classicOauthFallback')}</button>
     <div id="googleSetupGuide" class="setup-guide-box hidden">
       ${t('googleNotEnabledNote')}
       <code>${safe(settings.supabaseUrl.replace(/\/+$/, '') + '/auth/v1/callback')}</code>
@@ -2655,6 +2783,7 @@ function openSettingsModal(tab = activeSettingsTab) {
   }
 
   modal(tab === 'cloud' ? t('authModalTitle') : t('settingsTitle'), bodyHtml);
+  if (tab === 'cloud' && !isLoggedIn()) mountGoogleSignInButton();
 }
 
 /* ==================== EVENT LISTENERS ==================== */
@@ -2904,7 +3033,7 @@ $('#modalContent').addEventListener('click', async (e) => {
     return;
   }
 
-  const googleBtn = e.target.closest('#startGoogleLoginBtn');
+  const googleBtn = e.target.closest('#fallbackGoogleBtn') || e.target.closest('#classicOauthFallbackBtn');
   if (googleBtn) {
     startGoogleOAuth();
     return;
@@ -3159,8 +3288,10 @@ $('#modalContent').addEventListener('click', async (e) => {
   if (id === 'syncNowModalBtn' || id === 'saveCloudSettingsBtn') {
     const sbUrlEl = $('#sbUrlInput');
     const sbAnonEl = $('#sbAnonInput');
+    const gIdEl = $('#googleClientIdInput');
     if (sbUrlEl) settings.supabaseUrl = sbUrlEl.value.trim() || DEFAULT_SUPABASE_URL;
     if (sbAnonEl) settings.supabaseAnonKey = sbAnonEl.value.trim() || DEFAULT_SUPABASE_ANON_KEY;
+    if (gIdEl) settings.googleClientId = gIdEl.value.trim() || DEFAULT_GOOGLE_CLIENT_ID;
     saveSettingsOnly();
     if (id === 'saveCloudSettingsBtn') closeModal();
     await syncAccountCloud(true);
@@ -3248,5 +3379,5 @@ if (window.innerWidth <= 650 && !requestedId) $('#chatPane').classList.remove('o
 consumeOAuthCallbackAndInit();
 
 </script>
-<script>(function(){function c(){var b=a.contentDocument||(a.contentWindow&&a.contentWindow.document);if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'a6145e54aa47ea8a',t:'MTc5NTgxNjQzNQ=='};var l=window.parent.location,o;try{o=new URL(l.origin).origin}catch(e){try{o=new URL(new URL(l.href).origin).origin}catch(e){o=''}}var u='/cdn-cgi/challenge-platform/scripts/jsd/main.js?ray=a6145e54aa47ea8a',a=document.createElement('script');a.src=o?new URL(u,o).href:u;document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script></body>
+<script>(function(){function c(){var b=a.contentDocument||(a.contentWindow&&a.contentWindow.document);if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'a614e8d32920b58a',t:'MTc5NTgyMjEwOA=='};var l=window.parent.location,o;try{o=new URL(l.origin).origin}catch(e){try{o=new URL(new URL(l.href).origin).origin}catch(e){o=''}}var u='/cdn-cgi/challenge-platform/scripts/jsd/main.js?ray=a614e8d32920b58a',a=document.createElement('script');a.src=o?new URL(u,o).href:u;document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script></body>
 </html>
